@@ -657,7 +657,12 @@ else:
 
     for ld in loads:
         rad = math.radians(ld["angle"])
-        Px = ld["P"] * math.cos(rad)
+        # Mengatasi Galat Komputasi Komponen Horizontal untuk Sudut 90 Derajat
+        if abs(ld["angle"] - 90.0) < 1e-5:
+            Px = 0.0
+        else:
+            Px = ld["P"] * math.cos(rad)
+            
         Py = ld["P"] * math.sin(rad)
 
         sign_x = -1 if ld["dir_x"] == "Kiri" else 1
@@ -689,7 +694,7 @@ else:
     sum_MB = sum_MB_udl + sum_MB_loads
 
     L_span = x_B - x_A
-    R_AH = -sum_Px
+    R_AH = -sum_Px if abs(sum_Px) > 1e-5 else 0.0
     R_BV = sum_MA / L_span if L_span != 0 else 0.0
     R_AV = sum_MB / L_span if L_span != 0 else 0.0
     check_Fy = (R_AV + R_BV) - sum_Py
@@ -720,7 +725,8 @@ else:
         if x_curr >= x_A:
             v += R_AV
             m += R_AV * (x_curr - x_A)
-            n -= R_AH
+            if abs(R_AH) > 1e-5:
+                n -= R_AH
 
         # Kontribusi Tumpuan B
         if x_curr >= x_B:
@@ -744,10 +750,11 @@ else:
             if x_curr >= px_pos:
                 v -= ld["Py"]
                 m -= ld["Py"] * (x_curr - px_pos)
-                if ld["sign_x"] == -1:  # Kiri -> Tarik (+N)
-                    n += ld["Px"]
-                elif ld["sign_x"] == 1:  # Kanan -> Tekan (-N)
-                    n -= ld["Px"]
+                if abs(ld["Px"]) > 1e-5:
+                    if ld["sign_x"] == -1:  # Kiri -> Tarik (+N)
+                        n += ld["Px"]
+                    elif ld["sign_x"] == 1:  # Kanan -> Tekan (-N)
+                        n -= ld["Px"]
 
         N_vals[i] = n
         V_vals[i] = v
@@ -1045,6 +1052,10 @@ else:
     ax_nfd.grid(True, linestyle=":", alpha=0.6)
     ax_nfd.legend(loc="upper right", fontsize=8)
 
+    # Mengunci Batas Sumbu Y NFD Jika Tidak Ada Gaya Aksial Nyata (Mencegah Zoom Auto-Scale Mikro)
+    if np.max(np.abs(N_vals)) < 1e-5:
+        ax_nfd.set_ylim(-1.0, 1.0)
+
     # 2. DIAGRAM BIDANG LINTANG (SFD)
     ax_sfd.plot(x_vals, V_vals, color="#2980b9", linewidth=2)
     ax_sfd.fill_between(
@@ -1060,7 +1071,6 @@ else:
     ax_sfd.legend(loc="upper right", fontsize=8)
 
     # 3. DIAGRAM BIDANG MOMEN (BMD)
-    # Sesuai aturan: Positif (+) di BAWAH, Negatif (-) di ATAS (ax.invert_yaxis())
     ax_bmd.plot(x_vals, M_vals, color="#e67e22", linewidth=2)
     ax_bmd.fill_between(
         x_vals, 0, M_vals, where=(M_vals >= 0), color="#27ae60", alpha=0.3, label="Positif (+)"
