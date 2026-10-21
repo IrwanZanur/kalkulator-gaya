@@ -657,7 +657,6 @@ else:
 
     for ld in loads:
         rad = math.radians(ld["angle"])
-        # Mengatasi Galat Komputasi Komponen Horizontal untuk Sudut 90 Derajat
         if abs(ld["angle"] - 90.0) < 1e-5:
             Px = 0.0
         else:
@@ -709,70 +708,96 @@ else:
     min_x = min(all_x_points)
     max_x = max(all_x_points)
 
-    # Diskretisasi Rentang Batang
     num_pts = 1000
     x_vals = np.linspace(min_x, max_x, num_pts)
     N_vals = np.zeros_like(x_vals)
     V_vals = np.zeros_like(x_vals)
     M_vals = np.zeros_like(x_vals)
 
-    for i, x_curr in enumerate(x_vals):
-        n = 0.0
-        v = 0.0
-        m = 0.0
+    def calc_internal_forces_at(x_eval, side="right"):
+        eps = 1e-7 if side == "right" else -1e-7
+        xc = x_eval + eps
 
-        # Kontribusi Tumpuan A
-        if x_curr >= x_A:
-            v += R_AV
-            m += R_AV * (x_curr - x_A)
+        n_c, v_c, m_c = 0.0, 0.0, 0.0
+
+        if xc >= x_A:
+            v_c += R_AV
+            m_c += R_AV * (xc - x_A)
             if abs(R_AH) > 1e-5:
-                n -= R_AH
+                n_c -= R_AH
 
-        # Kontribusi Tumpuan B
-        if x_curr >= x_B:
-            v += R_BV
-            m += R_BV * (x_curr - x_B)
+        if xc >= x_B:
+            v_c += R_BV
+            m_c += R_BV * (xc - x_B)
 
-        # Kontribusi Beban Merata (UDL)
         for u in udl_details:
             xs, xe, w = u["x_start"], u["x_end"], u["w_conv"]
-            if x_curr > xs:
-                overlap = min(x_curr, xe) - xs
+            if xc > xs:
+                overlap = min(xc, xe) - xs
                 if overlap > 0:
                     w_force = w * overlap
                     w_center = xs + overlap / 2.0
-                    v -= w_force
-                    m -= w_force * (x_curr - w_center)
+                    v_c -= w_force
+                    m_c -= w_force * (xc - w_center)
 
-        # Kontribusi Beban Terpusat (P)
         for ld in load_details:
             px_pos = ld["x"]
-            if x_curr >= px_pos:
-                v -= ld["Py"]
-                m -= ld["Py"] * (x_curr - px_pos)
+            if xc >= px_pos:
+                v_c -= ld["Py"]
+                m_c -= ld["Py"] * (xc - px_pos)
                 if abs(ld["Px"]) > 1e-5:
-                    if ld["sign_x"] == -1:  # Kiri -> Tarik (+N)
-                        n += ld["Px"]
-                    elif ld["sign_x"] == 1:  # Kanan -> Tekan (-N)
-                        n -= ld["Px"]
+                    if ld["sign_x"] == -1:
+                        n_c += ld["Px"]
+                    elif ld["sign_x"] == 1:
+                        n_c -= ld["Px"]
 
-        N_vals[i] = n
-        V_vals[i] = v
-        M_vals[i] = m
+        return n_c, v_c, m_c
+
+    for i, x_curr in enumerate(x_vals):
+        n_c, v_c, m_c = calc_internal_forces_at(x_curr, side="right")
+        N_vals[i] = n_c
+        V_vals[i] = v_c
+        M_vals[i] = m_c
+
+    # Menentukan Titik-Titik Krisis untuk Garis Proyeksi Vertikal Tegak Lurus
+    crit_pts = [0.0, x_A, x_B]
+    for u in udl_details:
+        crit_pts.extend([u["x_start"], u["x_end"]])
+    for ld in load_details:
+        crit_pts.append(ld["x"])
+
+    crit_pts = sorted(list(set([round(p, 3) for p in crit_pts])))
+
+    extra_zero_pts = []
+    for u in udl_details:
+        xs, xe, w = u["x_start"], u["x_end"], u["w_conv"]
+        _, v_xs, _ = calc_internal_forces_at(xs, side="right")
+        _, v_xe, _ = calc_internal_forces_at(xe, side="left")
+        if v_xs * v_xe < 0 and w > 0:
+            x_zero = xs + (v_xs / w)
+            if xs < x_zero < xe:
+                extra_zero_pts.append(round(x_zero, 3))
+
+    all_crit_pts = sorted(list(set(crit_pts + extra_zero_pts)))
 
     # --- VISUALISASI UTAMA & LAYOUT METRIK ---
-    col_left, col_right = st.columns([1.3, 1])
+    col_left, col_right = st.columns([1.5, 1])
 
     with col_left:
-        st.subheader("🖼️ Diagram Gelagar, Beban, dan Reaksi Tumpuan")
+        st.subheader("🖼️ Diagram Gelagar & Gaya Dalam Terintegrasi (Sejajar)")
 
-        fig, ax = plt.subplots(figsize=(10, 4.8))
+        # Gambar Terpadu 4-in-1 Berbagii Sumbu X (sharex=True)
+        fig_combined, (ax_beam, ax_nfd, ax_sfd, ax_bmd) = plt.subplots(
+            4, 1, figsize=(11, 13), sharex=True, gridspec_kw={"height_ratios": [1.3, 0.8, 1, 1]}
+        )
 
         min_plot_x = min_x - 1.0
         max_plot_x = max_x + 1.0
 
-        # Plot Batang Gelagar
-        ax.plot([min_plot_x + 0.5, max_plot_x - 0.5], [0, 0], color="#2c3e50", linewidth=5, zorder=2)
+        # -------------------------------------------------------------
+        # 1. SUBPLOT ATAS: DIAGRAM GELAGAR / SOAL
+        # -------------------------------------------------------------
+        ax_beam.plot([min_plot_x + 0.5, max_plot_x - 0.5], [0, 0], color="#2c3e50", linewidth=5, zorder=2)
 
         # Plot Tumpuan A (Sendi)
         tumpuan_A = patches.Polygon(
@@ -782,8 +807,8 @@ else:
             ec="black",
             zorder=3,
         )
-        ax.add_patch(tumpuan_A)
-        ax.text(x_A, -0.65, "A (Sendi)", fontsize=10, fontweight="bold", ha="center")
+        ax_beam.add_patch(tumpuan_A)
+        ax_beam.text(x_A, -0.65, "A (Sendi)", fontsize=10, fontweight="bold", ha="center")
 
         # Plot Tumpuan B (Rol)
         tumpuan_B = patches.Polygon(
@@ -793,18 +818,18 @@ else:
             ec="black",
             zorder=3,
         )
-        ax.add_patch(tumpuan_B)
-        ax.add_patch(
+        ax_beam.add_patch(tumpuan_B)
+        ax_beam.add_patch(
             patches.Circle(
                 (x_B - 0.12, -0.38), 0.08, color="#34495e", ec="black", zorder=3
             )
         )
-        ax.add_patch(
+        ax_beam.add_patch(
             patches.Circle(
                 (x_B + 0.12, -0.38), 0.08, color="#34495e", ec="black", zorder=3
             )
         )
-        ax.text(x_B, -0.65, "B (Rol)", fontsize=10, fontweight="bold", ha="center")
+        ax_beam.text(x_B, -0.65, "B (Rol)", fontsize=10, fontweight="bold", ha="center")
 
         # Plot Beban Merata (UDL)
         udl_height = 0.55
@@ -823,12 +848,12 @@ else:
                 alpha=0.25,
                 zorder=3,
             )
-            ax.add_patch(rect)
+            ax_beam.add_patch(rect)
 
             num_arrows = max(3, int(length_u * 2.5))
             x_arrows = np.linspace(xs, xe, num_arrows)
             for xa in x_arrows:
-                ax.annotate(
+                ax_beam.annotate(
                     "",
                     xy=(xa, 0),
                     xytext=(xa, udl_height),
@@ -838,7 +863,7 @@ else:
                     zorder=4,
                 )
 
-            ax.text(
+            ax_beam.text(
                 u["x_Q"],
                 udl_height + 0.15,
                 f"{u['id']} = {u['w_orig']} {u['unit']}",
@@ -848,7 +873,7 @@ else:
                 ha="center",
             )
 
-            ax.vlines(
+            ax_beam.vlines(
                 u["x_Q"],
                 ymin=-0.2,
                 ymax=udl_height,
@@ -857,7 +882,7 @@ else:
                 linewidth=1,
                 zorder=1,
             )
-            ax.text(
+            ax_beam.text(
                 u["x_Q"],
                 udl_height + 0.5,
                 f"Q_{u['id']} = {u['Q_equiv']:.2f} t",
@@ -876,7 +901,7 @@ else:
             ang = ld["angle"]
 
             if ang == 90:
-                ax.annotate(
+                ax_beam.annotate(
                     f"{ld['id']} = {P_val:.1f} t",
                     xy=(x_pos, 0),
                     xytext=(x_pos, arrow_len),
@@ -898,7 +923,7 @@ else:
                 dir_mult = 1 if ld["sign_x"] < 0 else -1
                 dx = dir_mult * arrow_len * math.cos(rad)
                 dy = arrow_len * math.sin(rad)
-                ax.annotate(
+                ax_beam.annotate(
                     f"{ld['id']} = {P_val:.1f} t\n({ang}°)",
                     xy=(x_pos, 0),
                     xytext=(x_pos + dx, dy),
@@ -917,7 +942,7 @@ else:
                 )
 
         # Plot Reaksi Vertikal
-        ax.annotate(
+        ax_beam.annotate(
             f"R_AV\n{R_AV:.3f} t",
             xy=(x_A, 0),
             xytext=(x_A, -1.8),
@@ -934,7 +959,7 @@ else:
             fontweight="bold",
         )
 
-        ax.annotate(
+        ax_beam.annotate(
             f"R_BV\n{R_BV:.3f} t",
             xy=(x_B, 0),
             xytext=(x_B, -1.8),
@@ -951,14 +976,13 @@ else:
             fontweight="bold",
         )
 
-        # Plot Reaksi Horizontal R_AH
         if abs(R_AH) > 0.001:
             ah_dir = 1 if R_AH > 0 else -1
             y_rah = 0.45
             x_start = x_A
             x_end = x_A + 1.8 * ah_dir
 
-            ax.annotate(
+            ax_beam.annotate(
                 "",
                 xy=(x_end, y_rah),
                 xytext=(x_start, y_rah),
@@ -972,7 +996,7 @@ else:
                 ),
             )
 
-            ax.text(
+            ax_beam.text(
                 x_A + 0.9 * ah_dir,
                 y_rah + 0.15,
                 f"R_AH = {abs(R_AH):.3f} t",
@@ -989,10 +1013,78 @@ else:
                 ),
             )
 
-        ax.set_xlim(min_plot_x - 0.5, max_plot_x + 0.5)
-        ax.set_ylim(-2.2, 2.2)
-        ax.axis("off")
-        st.pyplot(fig)
+        ax_beam.set_ylim(-2.2, 2.2)
+        ax_beam.set_title("1. Diagram Gelagar, Beban, dan Tumpuan", fontsize=11, fontweight="bold")
+        for spine in ax_beam.spines.values():
+            spine.set_visible(False)
+        ax_beam.set_xticks([])
+        ax_beam.set_yticks([])
+
+        # -------------------------------------------------------------
+        # 2. DIAGRAM GAYA NORMAL (NFD)
+        # -------------------------------------------------------------
+        ax_nfd.plot(x_vals, N_vals, color="#8e44ad", linewidth=2)
+        ax_nfd.fill_between(
+            x_vals, 0, N_vals, where=(N_vals >= 0), color="#8e44ad", alpha=0.25, label="Tarik (+)"
+        )
+        ax_nfd.fill_between(
+            x_vals, 0, N_vals, where=(N_vals < 0), color="#c0392b", alpha=0.25, label="Tekan (-)"
+        )
+        ax_nfd.axhline(0, color="black", linewidth=1.2)
+        ax_nfd.set_ylabel("N (ton)", fontweight="bold")
+        ax_nfd.set_title("2. Diagram Gaya Normal (NFD)", fontsize=11, fontweight="bold")
+        ax_nfd.grid(True, linestyle=":", alpha=0.6)
+        ax_nfd.legend(loc="upper right", fontsize=8)
+
+        if np.max(np.abs(N_vals)) < 1e-5:
+            ax_nfd.set_ylim(-1.0, 1.0)
+
+        # -------------------------------------------------------------
+        # 3. DIAGRAM BIDANG LINTANG (SFD)
+        # -------------------------------------------------------------
+        ax_sfd.plot(x_vals, V_vals, color="#2980b9", linewidth=2)
+        ax_sfd.fill_between(
+            x_vals, 0, V_vals, where=(V_vals >= 0), color="#2980b9", alpha=0.3, label="Positif (+)"
+        )
+        ax_sfd.fill_between(
+            x_vals, 0, V_vals, where=(V_vals < 0), color="#e74c3c", alpha=0.3, label="Negatif (-)"
+        )
+        ax_sfd.axhline(0, color="black", linewidth=1.2)
+        ax_sfd.set_ylabel("D / V (ton)", fontweight="bold")
+        ax_sfd.set_title("3. Diagram Bidang Lintang (SFD)", fontsize=11, fontweight="bold")
+        ax_sfd.grid(True, linestyle=":", alpha=0.6)
+        ax_sfd.legend(loc="upper right", fontsize=8)
+
+        # -------------------------------------------------------------
+        # 4. DIAGRAM BIDANG MOMEN (BMD)
+        # -------------------------------------------------------------
+        ax_bmd.plot(x_vals, M_vals, color="#e67e22", linewidth=2)
+        ax_bmd.fill_between(
+            x_vals, 0, M_vals, where=(M_vals >= 0), color="#27ae60", alpha=0.3, label="Positif (+)"
+        )
+        ax_bmd.fill_between(
+            x_vals, 0, M_vals, where=(M_vals < 0), color="#e74c3c", alpha=0.3, label="Negatif (-)"
+        )
+        ax_bmd.axhline(0, color="black", linewidth=1.2)
+        ax_bmd.invert_yaxis()  # M(+) Di Bawah
+        ax_bmd.set_ylabel("M (ton.m)", fontweight="bold")
+        ax_bmd.set_xlabel("Posisi x dari Ujung Kiri Batang (m)", fontweight="bold")
+        ax_bmd.set_title("4. Diagram Bidang Momen (BMD) — [Positif (+) Di Bawah / Negatif (-) Di Atas]", fontsize=11, fontweight="bold")
+        ax_bmd.grid(True, linestyle=":", alpha=0.6)
+        ax_bmd.legend(loc="upper right", fontsize=8)
+
+        # -------------------------------------------------------------
+        # PENARIKAN GARIS PROYEKSI VERTIKAL TEGAK LURUS PADA SEMUA DIAGRAM
+        # -------------------------------------------------------------
+        for ax_curr in [ax_beam, ax_nfd, ax_sfd, ax_bmd]:
+            ax_curr.set_xlim(min_plot_x - 0.5, max_plot_x + 0.5)
+            for cx in all_crit_pts:
+                ax_curr.axvline(
+                    cx, color="#2c3e50", linestyle="--", linewidth=1, alpha=0.65, zorder=1
+                )
+
+        plt.tight_layout()
+        st.pyplot(fig_combined)
 
     with col_right:
         st.subheader("📊 Hasil Perhitungan Reaksi Tumpuan")
@@ -1030,75 +1122,11 @@ else:
         else:
             st.error(f"❌ **TIDAK SEIMBANG!** Selisih: {check_Fy:.4f}")
 
-    # ==========================================
-    # VISUALISASI DIAGRAM GAYA-GAYA DALAM (NFD, SFD, BMD)
-    # ==========================================
-    st.markdown("---")
-    st.subheader("📈 Diagram Gaya-Gaya Dalam (Internal Force Diagrams)")
-
-    fig_diag, (ax_nfd, ax_sfd, ax_bmd) = plt.subplots(3, 1, figsize=(11, 9), sharex=True)
-
-    # 1. DIAGRAM GAYA NORMAL (NFD)
-    ax_nfd.plot(x_vals, N_vals, color="#8e44ad", linewidth=2)
-    ax_nfd.fill_between(
-        x_vals, 0, N_vals, where=(N_vals >= 0), color="#8e44ad", alpha=0.25, label="Tarik (+)"
-    )
-    ax_nfd.fill_between(
-        x_vals, 0, N_vals, where=(N_vals < 0), color="#c0392b", alpha=0.25, label="Tekan (-)"
-    )
-    ax_nfd.axhline(0, color="black", linewidth=1.2)
-    ax_nfd.set_ylabel("N (ton)", fontweight="bold")
-    ax_nfd.set_title("Diagram Gaya Normal (NFD) — [Tarik (+) Di Atas / Tekan (-) Di Bawah]", fontsize=11, fontweight="bold")
-    ax_nfd.grid(True, linestyle=":", alpha=0.6)
-    ax_nfd.legend(loc="upper right", fontsize=8)
-
-    # Mengunci Batas Sumbu Y NFD Jika Tidak Ada Gaya Aksial Nyata (Mencegah Zoom Auto-Scale Mikro)
-    if np.max(np.abs(N_vals)) < 1e-5:
-        ax_nfd.set_ylim(-1.0, 1.0)
-
-    # 2. DIAGRAM BIDANG LINTANG (SFD)
-    ax_sfd.plot(x_vals, V_vals, color="#2980b9", linewidth=2)
-    ax_sfd.fill_between(
-        x_vals, 0, V_vals, where=(V_vals >= 0), color="#2980b9", alpha=0.3, label="Positif (+)"
-    )
-    ax_sfd.fill_between(
-        x_vals, 0, V_vals, where=(V_vals < 0), color="#e74c3c", alpha=0.3, label="Negatif (-)"
-    )
-    ax_sfd.axhline(0, color="black", linewidth=1.2)
-    ax_sfd.set_ylabel("D / V (ton)", fontweight="bold")
-    ax_sfd.set_title("Diagram Bidang Lintang (SFD) — [Positif (+) Di Atas / Negatif (-) Di Bawah]", fontsize=11, fontweight="bold")
-    ax_sfd.grid(True, linestyle=":", alpha=0.6)
-    ax_sfd.legend(loc="upper right", fontsize=8)
-
-    # 3. DIAGRAM BIDANG MOMEN (BMD)
-    ax_bmd.plot(x_vals, M_vals, color="#e67e22", linewidth=2)
-    ax_bmd.fill_between(
-        x_vals, 0, M_vals, where=(M_vals >= 0), color="#27ae60", alpha=0.3, label="Positif (+)"
-    )
-    ax_bmd.fill_between(
-        x_vals, 0, M_vals, where=(M_vals < 0), color="#e74c3c", alpha=0.3, label="Negatif (-)"
-    )
-    ax_bmd.axhline(0, color="black", linewidth=1.2)
-    ax_bmd.invert_yaxis()  # M(+) Di Bawah
-    ax_bmd.set_ylabel("M (ton.m)", fontweight="bold")
-    ax_bmd.set_xlabel("Posisi x dari Ujung Kiri Batang (m)", fontweight="bold")
-    ax_bmd.set_title("Diagram Bidang Momen (BMD) — [Positif (+) Di Bawah / Negatif (-) Di Atas]", fontsize=11, fontweight="bold")
-    ax_bmd.grid(True, linestyle=":", alpha=0.6)
-    ax_bmd.legend(loc="upper right", fontsize=8)
-
-    # Menandai Posisi Tumpuan A dan B dengan Garis Vertikal Putus-Putus
-    for ax_curr in [ax_nfd, ax_sfd, ax_bmd]:
-        ax_curr.axvline(x_A, color="#7f8c8d", linestyle="--", linewidth=1, alpha=0.7)
-        ax_curr.axvline(x_B, color="#7f8c8d", linestyle="--", linewidth=1, alpha=0.7)
-
-    plt.tight_layout()
-    st.pyplot(fig_diag)
-
-    # Ringkasan Nilai Maksimum Gaya Dalam
-    col_m1, col_m2, col_m3 = st.columns(3)
-    col_m1.metric("Gaya Normal Maks (N)", f"{np.max(np.abs(N_vals)):.3f} ton")
-    col_m2.metric("Gaya Lintang Maks (D/V)", f"{np.max(np.abs(V_vals)):.3f} ton")
-    col_m3.metric("Momen Maksimum (M)", f"{np.max(np.abs(M_vals)):.3f} ton.m")
+        st.markdown("---")
+        st.subheader("📌 Ringkasan Nilai Maksimum Gaya Dalam")
+        st.metric("Gaya Normal Maks (N)", f"{np.max(np.abs(N_vals)):.3f} ton")
+        st.metric("Gaya Lintang Maks (D/V)", f"{np.max(np.abs(V_vals)):.3f} ton")
+        st.metric("Momen Maksimum (M)", f"{np.max(np.abs(M_vals)):.3f} ton.m")
 
     # --- DETAIL URAIAN PERHITUNGAN (EXPANDER) ---
     st.markdown("---")
@@ -1186,7 +1214,94 @@ else:
             f"R_{{AV}} = \\frac{{{sum_MB:.3f}}}{{{L_span:.2f}}} = \\mathbf{{{R_AV:.3f} \\text{{ ton}}}}"
         )
 
-        st.markdown("### 6. Aturan Tanda Penggambaran Diagram Gaya-Gaya Dalam")
+        # --- DEDICATED ANALYTICAL SFD & BMD BREAKDOWN FOR STUDENTS ---
+        st.markdown("### 6. Analisis Detail Nilai Bidang Lintang (SFD / Gaya $D$)")
+        st.write(
+            "Nilai gaya lintang ($D$) dihitung dari jumlah gaya vertikal "
+            "di sebelah kiri potongan pada setiap titik krisis gelagar:"
+        )
+
+        for pt in all_crit_pts:
+            labels = []
+            if abs(pt - 0.0) < 1e-3:
+                labels.append("Ujung Kiri Batang")
+            if abs(pt - x_A) < 1e-3:
+                labels.append("Tumpuan A")
+            if abs(pt - x_B) < 1e-3:
+                labels.append("Tumpuan B")
+            for u in udl_details:
+                if abs(pt - u["x_start"]) < 1e-3:
+                    labels.append(f"Awal Beban Merata {u['id']}")
+                if abs(pt - u["x_end"]) < 1e-3:
+                    labels.append(f"Akhir Beban Merata {u['id']}")
+            for ld in load_details:
+                if abs(pt - ld["x"]) < 1e-3:
+                    labels.append(f"Titik Beban {ld['id']}")
+            if pt in extra_zero_pts:
+                labels.append("Titik D = 0 (Lokasi Momen Maksimum)")
+
+            lbl_str = ", ".join(labels) if labels else ""
+            lbl_header = f"Titik $x = {pt:.2f}\\text{{ m}}$" + (f" ({lbl_str})" if lbl_str else "")
+
+            _, v_left, _ = calc_internal_forces_at(pt, side="left")
+            _, v_right, _ = calc_internal_forces_at(pt, side="right")
+
+            if abs(v_left - v_right) > 1e-3:
+                st.markdown(f"* **{lbl_header}**:")
+                st.markdown(
+                    f"  * Sisi Kiri Potongan ($x^-$): $D = \\mathbf{{{v_left:.3f} \\text{{ ton}}}}$"
+                )
+                st.markdown(
+                    f"  * Sisi Kanan Potongan ($x^+$): $D = \\mathbf{{{v_right:.3f} \\text{{ ton}}}}$ "
+                    f"*(Terjadi lompatan sebesar gaya terpusat/reaksi tumpuan)*"
+                )
+            else:
+                st.markdown(
+                    f"* **{lbl_header}**: $D = \\mathbf{{{v_right:.3f} \\text{{ ton}}}}$"
+                )
+
+        st.markdown("### 7. Analisis Detail Nilai Bidang Momen (BMD / Momen $M$)")
+        st.write(
+            "Nilai momen lentur ($M$) dihitung dari jumlah momen gaya di sebelah kiri "
+            "potongan terhadap titik yang ditinjau:"
+        )
+
+        for pt in all_crit_pts:
+            labels = []
+            if abs(pt - 0.0) < 1e-3:
+                labels.append("Ujung Kiri Batang")
+            if abs(pt - x_A) < 1e-3:
+                labels.append("Tumpuan A")
+            if abs(pt - x_B) < 1e-3:
+                labels.append("Tumpuan B")
+            for u in udl_details:
+                if abs(pt - u["x_start"]) < 1e-3:
+                    labels.append(f"Awal Beban Merata {u['id']}")
+                if abs(pt - u["x_end"]) < 1e-3:
+                    labels.append(f"Akhir Beban Merata {u['id']}")
+            for ld in load_details:
+                if abs(pt - ld["x"]) < 1e-3:
+                    labels.append(f"Titik Beban {ld['id']}")
+            if pt in extra_zero_pts:
+                labels.append("Titik D = 0 (Lokasi Momen Maksimum)")
+
+            lbl_str = ", ".join(labels) if labels else ""
+            lbl_header = f"Titik $x = {pt:.2f}\\text{{ m}}$" + (f" ({lbl_str})" if lbl_str else "")
+
+            _, _, m_val = calc_internal_forces_at(pt, side="right")
+
+            if abs(m_val) < 1e-5:
+                desc = "(Momen Nol)"
+            elif m_val > 0:
+                desc = "(Momen Positif — Serat bawah tertarik)"
+            else:
+                desc = "(Momen Negatif — Serat atas tertarik)"
+
+            st.markdown(
+                f"* **{lbl_header}**: $M = \\mathbf{{{m_val:.3f} \\text{{ ton.m}}}} \\quad {desc}$"
+            )
+
+        st.markdown("### 8. Aturan Tanda Penggambaran Diagram Gaya-Gaya Dalam")
         st.markdown("""
         * **Diagram Gaya Normal (NFD)**:
           * **Tarik (+)**: Digambar **DI ATAS** garis netral ($N > 0$).
